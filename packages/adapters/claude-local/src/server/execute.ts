@@ -579,12 +579,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const taskContextNote = asString(context.paperclipTaskMarkdown, "").trim();
+
+  // When resuming a session without a full wake payload, inject task context so
+  // the agent knows which task it was woken for instead of blindly continuing
+  // its previous cached conversation.
+  const resumeTaskContext =
+    sessionId && !shouldUseResumeDeltaPrompt
+      ? [
+          env.PAPERCLIP_TASK_ID ? `Your current task: ${env.PAPERCLIP_TASK_ID}.` : "",
+          env.PAPERCLIP_WAKE_REASON ? `Wake reason: ${env.PAPERCLIP_WAKE_REASON}.` : "",
+          "Check your inbox before continuing previous work.",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      : "";
+
+
   const prompt = joinPromptSections([
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
     taskContextNote,
     renderedPrompt,
+    resumeTaskContext,
   ]);
   const promptMetrics = {
     promptChars: prompt.length,
@@ -593,6 +610,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     sessionHandoffChars: sessionHandoffNote.length,
     taskContextChars: taskContextNote.length,
     heartbeatPromptChars: renderedPrompt.length,
+    resumeTaskContextChars: resumeTaskContext.length,
   };
 
   const buildClaudeArgs = (

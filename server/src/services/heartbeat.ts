@@ -1783,6 +1783,11 @@ export function mergeCoalescedContextSnapshot(
     // regenerate any structured payload from those ids.
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
   }
+  // forceFreshSession is sticky: once requested it must survive coalescing so
+  // the queued run still starts a fresh session even if later wakes omit it.
+  if (existing?.forceFreshSession === true || incoming?.forceFreshSession === true) {
+    merged.forceFreshSession = true;
+  }
   return merged;
 }
 
@@ -8434,7 +8439,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
-        contextSnapshot,
+        enrichedContextSnapshot,
       );
       const mergedRun = await db
         .update(heartbeatRuns)
