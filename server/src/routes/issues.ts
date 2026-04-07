@@ -1778,7 +1778,7 @@ export function issueRoutes(
     });
     const statusBecameActionable =
       req.body.status !== undefined &&
-      existing.status !== req.body.status &&
+      existing.status !== issue.status &&
       ["blocked", "in_review"].includes(existing.status) &&
       ["todo", "in_progress"].includes(issue.status);
 
