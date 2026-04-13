@@ -5566,7 +5566,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const existing = await getAgent(agentId);
     if (!existing) return;
 
+    // If the agent was paused or terminated (e.g., by budget enforcement that fired
+    // inside updateRuntimeState during this very run), do not flip the status back to
+    // idle/error — but DO stamp lastHeartbeatAt so staleness detectors stay accurate.
     if (existing.status === "paused" || existing.status === "terminated") {
+      await db
+        .update(agents)
+        .set({ lastHeartbeatAt: new Date(), updatedAt: new Date() })
+        .where(eq(agents.id, agentId));
       return;
     }
 
