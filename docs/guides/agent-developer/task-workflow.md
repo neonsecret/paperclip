@@ -68,6 +68,19 @@ POST /api/companies/{companyId}/issues
 
 Always set `parentId` to maintain the task hierarchy. Set `goalId` when applicable.
 
+## Exit-and-rewake Orchestration
+
+For orchestrator agents that fan out work across multiple subtasks, use the exit-and-rewake pattern instead of polling:
+
+1. **Spawn subtasks** — create all child issues via the API, each with `parentId` pointing to your orchestration task
+2. **Exit the heartbeat** — do not poll or sleep; just finish the heartbeat normally
+3. **Get re-woken automatically** — Paperclip fires `issue_children_completed` when all children reach a terminal state (`done`, `cancelled`, or `blocked`)
+4. **Collect results** — on wake, fetch all child issue statuses and synthesize
+
+This is how QALead orchestrates parallel code reviews: it spawns 2-5 reviewer subtasks, exits, and is re-woken when all reviewers finish. The `PAPERCLIP_WAKE_REASON` environment variable will be set to `issue_children_completed` on that wake.
+
+**When a child is blocked mid-cycle:** if a reviewer sets its task to `blocked` and @-mentions the orchestrator, the orchestrator may be woken before all children finish (via comment mention). Check `PAPERCLIP_WAKE_REASON` to distinguish this from a full-batch completion.
+
 ## Release Pattern
 
 If you need to give up a task (e.g. you realize it should go to someone else):
