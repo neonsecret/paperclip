@@ -2803,7 +2803,44 @@ export function heartbeatService(db: Db) {
     const reaped: string[] = [];
 
     for (const { run, adapterType, runtimeConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      const rc = parseObject(runtimeConfig);
+      const runningMs = run.startedAt ? now.getTime() - new Date(run.startedAt).getTime() : 0;
+
+      // Wall-clock cap: kill any run (tracked or not) that has exceeded
+      // maxRunDurationMinutes. Without this the reaper skips in-memory-tracked
+      // runs forever, so a Claude child stuck in a slow API call or tool-use
+      // loop runs indefinitely. Default 90 min is generous vs maxTurnsPerRun:
+      // 200 (typical run completes in 10-30 min).
+      const maxRunDurationMin = typeof rc.maxRunDurationMinutes === "number"
+        ? rc.maxRunDurationMinutes
+        : 90;
+      const exceededMaxDuration = maxRunDurationMin > 0 && runningMs > maxRunDurationMin * 60 * 1000;
+
+      const tracked = runningProcesses.has(run.id) || activeRunExecutions.has(run.id);
+      if (tracked && !exceededMaxDuration) continue;
+
+      if (exceededMaxDuration && tracked) {
+        // Forcibly release the tracking handle so the reaper can finalize this run
+        // the same way it finalizes truly-orphaned runs below.
+        if (run.processPid) {
+          try {
+            process.kill(run.processPid, "SIGTERM");
+          } catch {
+            // process may have exited between check and kill
+          }
+        }
+        runningProcesses.delete(run.id);
+        activeRunExecutions.delete(run.id);
+        logger.warn(
+          {
+            runId: run.id,
+            agentId: run.agentId,
+            runningMinutes: Math.round(runningMs / 60000),
+            maxRunDurationMinutes: maxRunDurationMin,
+          },
+          "killed tracked run that exceeded maxRunDurationMinutes",
+        );
+      }
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -2815,14 +2852,12 @@ export function heartbeatService(db: Db) {
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive && run.processPid) {
-        // Hard timeout: if the agent has orphanedRunTimeoutMinutes configured and the
-        // run has exceeded it, kill the process and reap anyway. Handles hung processes
-        // (e.g. wifi outage where the CLI hangs on API calls). Below the threshold the
-        // upstream DETACHED behavior is preserved so legitimate long-running work isn't
-        // killed.
-        const rc = parseObject(runtimeConfig);
+        // Hard timeout for orphaned (untracked) runs with a still-alive PID.
+        // maxRunDurationMinutes above handles the tracked case; this retains
+        // the previous per-agent orphanedRunTimeoutMinutes semantics for runs
+        // whose in-memory handle was lost (server restart, wifi outage, etc.)
+        // but whose PID kept breathing.
         const hardTimeoutMin = typeof rc.orphanedRunTimeoutMinutes === "number" ? rc.orphanedRunTimeoutMinutes : 0;
-        const runningMs = run.startedAt ? now.getTime() - new Date(run.startedAt).getTime() : 0;
         if (hardTimeoutMin > 0 && runningMs > hardTimeoutMin * 60 * 1000) {
           try {
             process.kill(run.processPid, "SIGTERM");
