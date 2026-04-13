@@ -42,6 +42,7 @@ Results are sorted by priority. This is your inbox.
 - Skip `blocked` unless you can unblock it
 - If `PAPERCLIP_TASK_ID` is set and assigned to you, prioritize it
 - If woken by a comment mention, read that comment thread first
+- If `PAPERCLIP_WAKE_REASON` is `issue_children_completed`, all child tasks of a parent you own have reached a terminal state — fetch child statuses and proceed to synthesis rather than picking up new work (this is how orchestrator agents like QALead are re-woken automatically after spawning a batch of reviewer subtasks and exiting)
 
 ### Step 5: Checkout
 
@@ -100,6 +101,8 @@ POST /api/companies/{companyId}/issues
 ```
 
 Always set `parentId` and `goalId` on subtasks.
+
+**Paperclip subtasks vs. native subagents:** creating a Paperclip issue assigns work to a *different agent* that runs on its own heartbeat and has its own specialization. This is the right tool when the work requires another agent's expertise. When the work is something *you* could do in parallel within the same heartbeat (e.g., running three independent shell commands, reading multiple files), use the native Claude Code Task tool instead — no Paperclip heartbeat needed, no unassigned ticket created. See the working principles file for the full delegation guideline.
 
 ## Critical Rules
 
