@@ -2784,6 +2784,7 @@ export function heartbeatService(db: Db) {
       .select({
         run: heartbeatRuns,
         adapterType: agents.adapterType,
+        runtimeConfig: agents.runtimeConfig,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -2791,7 +2792,7 @@ export function heartbeatService(db: Db) {
 
     const reaped: string[] = [];
 
-    for (const { run, adapterType } of activeRuns) {
+    for (const { run, adapterType, runtimeConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
@@ -2803,26 +2804,43 @@ export function heartbeatService(db: Db) {
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
-      if (processPidAlive) {
-        if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
-          const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
-            error: detachedMessage,
-            errorCode: DETACHED_PROCESS_ERROR_CODE,
-          });
-          if (detachedRun) {
-            await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
-              eventType: "lifecycle",
-              stream: "system",
-              level: "warn",
-              message: detachedMessage,
-              payload: {
-                processPid: run.processPid,
-              },
-            });
+      if (processPidAlive && run.processPid) {
+        // Hard timeout: if the agent has orphanedRunTimeoutMinutes configured and the
+        // run has exceeded it, kill the process and reap anyway. Handles hung processes
+        // (e.g. wifi outage where the CLI hangs on API calls). Below the threshold the
+        // upstream DETACHED behavior is preserved so legitimate long-running work isn't
+        // killed.
+        const rc = parseObject(runtimeConfig);
+        const hardTimeoutMin = typeof rc.orphanedRunTimeoutMinutes === "number" ? rc.orphanedRunTimeoutMinutes : 0;
+        const runningMs = run.startedAt ? now.getTime() - new Date(run.startedAt).getTime() : 0;
+        if (hardTimeoutMin > 0 && runningMs > hardTimeoutMin * 60 * 1000) {
+          try {
+            process.kill(run.processPid, "SIGTERM");
+          } catch {
+            // process may have exited between check and kill
           }
+          // fall through to upstream's reaping logic (processGroupAlive cleanup + setRunStatus failed)
+        } else {
+          if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
+            const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
+            const detachedRun = await setRunStatus(run.id, "running", {
+              error: detachedMessage,
+              errorCode: DETACHED_PROCESS_ERROR_CODE,
+            });
+            if (detachedRun) {
+              await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message: detachedMessage,
+                payload: {
+                  processPid: run.processPid,
+                },
+              });
+            }
+          }
+          continue;
         }
-        continue;
       }
 
       let descendantOnlyCleanup = false;
@@ -2878,6 +2896,39 @@ export function heartbeatService(db: Db) {
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
+    }
+
+    // Backstop: clear executionRunId on issues that point to a terminal run.
+    // This catches cases where releaseIssueExecutionAndPromote was skipped
+    // (e.g. getRun returned null in the finalization error path, and the
+    // .catch(() => undefined) swallowed the error).
+    const staleLockedIssues = await db
+      .select({ issueId: issues.id, executionRunId: issues.executionRunId })
+      .from(issues)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+      .where(
+        inArray(heartbeatRuns.status, ["failed", "succeeded", "cancelled", "timed_out"])
+      );
+
+    for (const lock of staleLockedIssues) {
+      await db
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.id, lock.issueId),
+            eq(issues.executionRunId, lock.executionRunId!)
+          )
+        );
+      logger.warn(
+        { issueId: lock.issueId, executionRunId: lock.executionRunId },
+        "cleared stale executionRunId pointing to terminal run"
+      );
     }
 
     if (reaped.length > 0) {
