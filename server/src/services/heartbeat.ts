@@ -2629,7 +2629,10 @@ export function heartbeatService(db: Db) {
     const heartbeat = parseObject(runtimeConfig.heartbeat);
 
     return {
-      enabled: asBoolean(heartbeat.enabled, false),
+      // Default to true when intervalSec > 0 and enabled is not explicitly set.
+      // Agents created after 844b0612 have enabled:false stamped explicitly in the DB,
+      // so this default only applies to pre-existing agents that relied on the old default of true.
+      enabled: asBoolean(heartbeat.enabled, asNumber(heartbeat.intervalSec, 0) > 0),
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
