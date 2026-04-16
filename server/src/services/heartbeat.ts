@@ -2624,13 +2624,15 @@ export function heartbeatService(db: Db) {
     return queued;
   }
 
-  // Returns Vertex AI env vars from the server process environment if all three
-  // required vars are present, otherwise returns null (no fallback available).
+  // Returns Vertex AI env vars to inject into rate-limit retry runs.
+  // Reads from PAPERCLIP_RATELIMIT_FALLBACK_VERTEX_* keys so these vars
+  // are NOT present in the server's own process.env under their real names —
+  // this prevents them from bleeding into every agent subprocess via the
+  // { ...process.env, ...env } merge in execute.ts. Only retry runs get them.
   function buildVertexFallbackEnv(): Record<string, string> | null {
-    const project = process.env.ANTHROPIC_VERTEX_PROJECT_ID;
-    const region = process.env.CLOUD_ML_REGION;
-    const useVertex = process.env.CLAUDE_CODE_USE_VERTEX;
-    if (!project || !region || useVertex !== "1") return null;
+    const project = process.env.PAPERCLIP_RATELIMIT_FALLBACK_VERTEX_PROJECT_ID;
+    const region = process.env.PAPERCLIP_RATELIMIT_FALLBACK_VERTEX_REGION;
+    if (!project || !region) return null;
     return {
       CLAUDE_CODE_USE_VERTEX: "1",
       ANTHROPIC_VERTEX_PROJECT_ID: project,
