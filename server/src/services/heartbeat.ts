@@ -5127,6 +5127,137 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  function isRateLimitError(errorMessage: string | null | undefined): boolean {
+    if (!errorMessage) return false;
+    return /rate.limit|usage.limit|exceeded.*(?:current|your).*limit|hit.*(?:your|the).*limit|too many requests|429/i.test(
+      errorMessage,
+    );
+  }
+
+  async function enqueueRateLimitRetry(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now: Date,
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+
+    // Don't retry a retry
+    if (readNonEmptyString(contextSnapshot.retryReason) === "rate_limit") {
+      return null;
+    }
+
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
+    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+
+    const runtimeConfig = parseObject(agent.runtimeConfig);
+    const heartbeat = parseObject(runtimeConfig.heartbeat);
+    const delaySec = asNumber(heartbeat.rateLimitRetryDelaySec, 1800);
+    const scheduledAfter = new Date(now.getTime() + delaySec * 1000).toISOString();
+
+    const retryContextSnapshot = {
+      ...contextSnapshot,
+      retryOfRunId: run.id,
+      wakeReason: "rate_limit_retry",
+      retryReason: "rate_limit",
+      scheduledAfter,
+    };
+
+    const queued = await db.transaction(async (tx) => {
+      const wakeupRequest = await tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "rate_limit_retry",
+          payload: {
+            ...(issueId ? { issueId } : {}),
+            retryOfRunId: run.id,
+          },
+          status: "queued",
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const retryRun = await tx
+        .insert(heartbeatRuns)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeupRequest.id,
+          contextSnapshot: retryContextSnapshot,
+          sessionIdBefore: sessionBefore,
+          retryOfRunId: run.id,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      await tx
+        .update(agentWakeupRequests)
+        .set({ runId: retryRun.id, updatedAt: now })
+        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+      if (issueId) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: retryRun.id,
+            executionAgentNameKey: normalizeAgentNameKey(agent.name),
+            executionLockedAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
+      }
+
+      return retryRun;
+    });
+
+    publishLiveEvent({
+      companyId: queued.companyId,
+      type: "heartbeat.run.queued",
+      payload: {
+        runId: queued.id,
+        agentId: queued.agentId,
+        invocationSource: queued.invocationSource,
+        triggerDetail: queued.triggerDetail,
+        wakeupRequestId: queued.wakeupRequestId,
+      },
+    });
+
+    await appendRunEvent(queued, 1, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: `Queued rate-limit retry (scheduled after ${scheduledAfter})`,
+      payload: { retryOfRunId: run.id, scheduledAfter },
+    });
+
+    // Schedule a dequeue after the delay. If the server restarts before
+    // the timer fires, the queued run persists in the DB and will be
+    // picked up by the next event-driven trigger or uptime monitor.
+    setTimeout(() => {
+      startNextQueuedRunForAgent(agent.id).catch((err) => {
+        logger.error({ err, agentId: agent.id }, "rate-limit retry dequeue failed");
+      });
+    }, delaySec * 1000);
+
+    logger.info(
+      { agentId: agent.id, runId: run.id, retryRunId: queued.id, delaySec, scheduledAfter },
+      "rate-limit retry queued",
+    );
+
+    return queued;
+  }
+
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
@@ -6221,8 +6352,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      const now = new Date();
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
+        // Skip runs scheduled for the future (e.g. rate-limit retries)
+        const scheduledAfter = readNonEmptyString(parseObject(queuedRun.contextSnapshot).scheduledAfter);
+        if (scheduledAfter && new Date(scheduledAfter) > now) {
+          continue;
+        }
         const claimed = await claimQueuedRun(queuedRun);
         if (claimed) claimedRuns.push(claimed);
       }
@@ -7371,8 +7508,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
         await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(livenessRun);
         await handleRunLivenessContinuation(livenessRun);
+
+        // Rate-limit retry: if the run failed due to rate limiting,
+        // queue a delayed retry instead of releasing the issue execution.
+        if (outcome === "failed" && isRateLimitError(adapterResult.errorMessage)) {
+          const retryRun = await enqueueRateLimitRetry(livenessRun, agent, new Date());
+          if (retryRun) {
+            // Issue execution lock transferred to retry run inside
+            // enqueueRateLimitRetry — skip releaseIssueExecutionAndPromote.
+          } else {
+            await releaseIssueExecutionAndPromote(livenessRun);
+          }
+        } else {
+          await releaseIssueExecutionAndPromote(livenessRun);
+        }
       }
 
       if (finalizedRun) {
