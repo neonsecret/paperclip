@@ -222,6 +222,12 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     if (typeof value === "string") env[key] = value;
   }
 
+  // Apply per-run env overrides from context snapshot (e.g. Vertex creds injected by rate-limit retry).
+  const adapterEnvOverrides = parseObject(context.adapterEnvOverrides);
+  for (const [key, value] of Object.entries(adapterEnvOverrides)) {
+    if (typeof value === "string") env[key] = value;
+  }
+
   if (!hasExplicitApiKey && authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }

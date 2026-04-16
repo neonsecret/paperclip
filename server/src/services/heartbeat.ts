@@ -2624,6 +2624,20 @@ export function heartbeatService(db: Db) {
     return queued;
   }
 
+  // Returns Vertex AI env vars from the server process environment if all three
+  // required vars are present, otherwise returns null (no fallback available).
+  function buildVertexFallbackEnv(): Record<string, string> | null {
+    const project = process.env.ANTHROPIC_VERTEX_PROJECT_ID;
+    const region = process.env.CLOUD_ML_REGION;
+    const useVertex = process.env.CLAUDE_CODE_USE_VERTEX;
+    if (!project || !region || useVertex !== "1") return null;
+    return {
+      CLAUDE_CODE_USE_VERTEX: "1",
+      ANTHROPIC_VERTEX_PROJECT_ID: project,
+      CLOUD_ML_REGION: region,
+    };
+  }
+
   function isRateLimitError(errorMessage: string | null | undefined): boolean {
     if (!errorMessage) return false;
     return /rate.limit|usage.limit|exceeded.*(?:current|your).*limit|hit.*(?:your|the).*limit|too many requests|429/i.test(
@@ -2652,12 +2666,19 @@ export function heartbeatService(db: Db) {
     const delaySec = asNumber(heartbeat.rateLimitRetryDelaySec, 1800);
     const scheduledAfter = new Date(now.getTime() + delaySec * 1000).toISOString();
 
+    // If Vertex creds are available in the server environment, inject them into the
+    // retry run so the Claude subprocess uses API billing instead of the exhausted
+    // subscription account. This lets the retry run through even while the subscription
+    // limit is still active. The next non-retry run goes back to subscription as normal.
+    const vertexEnvOverrides = buildVertexFallbackEnv();
+
     const retryContextSnapshot = {
       ...contextSnapshot,
       retryOfRunId: run.id,
       wakeReason: "rate_limit_retry",
       retryReason: "rate_limit",
       scheduledAfter,
+      ...(vertexEnvOverrides ? { adapterEnvOverrides: vertexEnvOverrides } : {}),
     };
 
     const queued = await db.transaction(async (tx) => {
