@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -1578,14 +1578,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function reconcileStrandedAssignedIssues() {
+    // Include "blocked" issues whose checkout run failed with process_lost — these
+    // were auto-escalated by the recovery mechanism itself (not by a human/agent
+    // deliberate block) and are safe to re-queue after a server restart.
+    const systemBlockedSubquery = db
+      .select({ issueId: sql<string>`(${heartbeatRuns.contextSnapshot} ->> 'issueId')::uuid` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.errorCode, "process_lost"),
+          eq(heartbeatRuns.status, "failed"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is not null`,
+        ),
+      );
+
     const candidates = await db
       .select()
       .from(issues)
       .where(
         and(
           isNull(issues.assigneeUserId),
-          inArray(issues.status, ["todo", "in_progress"]),
           sql`${issues.assigneeAgentId} is not null`,
+          or(
+            inArray(issues.status, ["todo", "in_progress"]),
+            and(
+              eq(issues.status, "blocked"),
+              inArray(issues.id, systemBlockedSubquery),
+            ),
+          ),
         ),
       );
 
