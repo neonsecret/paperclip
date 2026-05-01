@@ -1,0 +1,353 @@
+diff --git a/dist/server/execute.js b/dist/server/execute.js
+index 93cddf8243271f5fb3ab101617f9114257e41328..177429930a544c2d9cd3d7ec36dc4957414aa37e 100644
+--- a/dist/server/execute.js
++++ b/dist/server/execute.js
+@@ -58,18 +58,18 @@ Title: {{taskTitle}}
+ 
+ 1. Work on the task using your tools
+ 2. When done, mark the issue as completed:
+-   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Content-Type: application/json" -d '{"status":"done"}'\`
++   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "Content-Type: application/json" -d '{"status":"done"}'\`
+ 3. Post a completion comment on the issue summarizing what you did:
+-   \`curl -s -X POST "{{paperclipApiUrl}}/issues/{{taskId}}/comments" -H "Content-Type: application/json" -d '{"body":"DONE: <your summary here>"}'\`
++   \`curl -s -X POST "{{paperclipApiUrl}}/issues/{{taskId}}/comments" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "Content-Type: application/json" -d '{"body":"DONE: <your summary here>"}'\`
+ 4. If this issue has a parent (check the issue body or comments for references like TRA-XX), post a brief notification on the parent issue so the parent owner knows:
+-   \`curl -s -X POST "{{paperclipApiUrl}}/issues/PARENT_ISSUE_ID/comments" -H "Content-Type: application/json" -d '{"body":"{{agentName}} completed {{taskId}}. Summary: <brief>"}'\`
++   \`curl -s -X POST "{{paperclipApiUrl}}/issues/PARENT_ISSUE_ID/comments" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "Content-Type: application/json" -d '{"body":"{{agentName}} completed {{taskId}}. Summary: <brief>"}'\`
+ {{/taskId}}
+ 
+ {{#commentId}}
+ ## Comment on This Issue
+ 
+ Someone commented. Read it:
+-   \`curl -s "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" | python3 -m json.tool\`
++   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" | python3 -m json.tool\`
+ 
+ Address the comment, POST a reply if needed, then continue working.
+ {{/commentId}}
+@@ -78,17 +78,17 @@ Address the comment, POST a reply if needed, then continue working.
+ ## Heartbeat Wake — Check for Work
+ 
+ 1. List ALL open issues assigned to you (todo, backlog, in_progress):
+-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
++   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
+ 
+ 2. If issues found, pick the highest priority one that is not done/cancelled and work on it:
+-   - Read the issue details: \`curl -s "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
++   - Read the issue details: \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
+    - Do the work in the project directory: {{projectName}}
+    - When done, mark complete and post a comment (see Workflow steps 2-4 above)
+ 
+ 3. If no issues assigned to you, check for unassigned issues:
+-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
++   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
+    If you find a relevant issue, assign it to yourself:
+-   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
++   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
+ 
+ 4. If truly nothing to do, report briefly what you checked.
+ {{/noTask}}`;
+@@ -225,18 +225,116 @@ function parseHermesOutput(stdout, stderr) {
+     if (costMatch?.[1]) {
+         result.costUsd = parseFloat(costMatch[1]);
+     }
+-    // Check for error patterns in stderr
++    // Check for error patterns in stderr.
++    // CRITICAL: must NOT match our own carousel progress lines or the upstream
++    // per-iteration "API call failed after N retries: HTTP 429" rate-limit chatter,
++    // because those appear on EVERY successful run that walked the carousel before
++    // landing on a working model. If errorMessage is set on a clean exit-0 run,
++    // Paperclip flips the run to status=failed errorCode=adapter_failed even though
++    // the agent did real work. Silently mislabels successful runs.
++    //
++    // The `[hermes]` filter is intentionally narrow: it matches only the specific
++    // benign carousel/fallback markers WE emit. Anything else with a `[hermes]`
++    // prefix (e.g. unexpected fatal from our own code, future log lines) stays
++    // visible so real failures aren't hidden by an over-broad regex.
++    const HERMES_BENIGN_RE = /^\s*\[hermes\]\s+(Failed \(|All keys exhausted on |Carousel: |Carousel exhausted |Using .+ provider directly |Falling back to |Claude fallback (?:succeeded|also failed|disabled)|FALLBACK_USED |FALLBACK_SKIPPED |Starting Hermes|Resuming session:|Exit code:|Session:)/;
+     if (stderr.trim()) {
+         const errorLines = stderr
+             .split("\n")
+             .filter((line) => /error|exception|traceback|failed/i.test(line))
+-            .filter((line) => !/INFO|DEBUG|warn/i.test(line)); // skip log-level noise
++            .filter((line) => !/INFO|DEBUG|warn/i.test(line)) // skip log-level noise
++            .filter((line) => !HERMES_BENIGN_RE.test(line)) // skip only known-benign [hermes] markers
++            .filter((line) => !/^\s*API call failed after \d+ retries:/.test(line)); // skip upstream rate-limit retries
+         if (errorLines.length > 0) {
+             result.errorMessage = errorLines.slice(0, 5).join("\n");
+         }
+     }
+     return result;
+ }
++// ---------------------------------------------------------------------------
++// Free model ranker — shir-man.com scoring approach
++// ---------------------------------------------------------------------------
++let _rankedFreeModels = null;
++let _rankedFreeModelsAt = 0;
++const MODELS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
++
++async function getRankedFreeModels() {
++    const now = Date.now();
++    if (_rankedFreeModels && now - _rankedFreeModelsAt < MODELS_CACHE_TTL) return _rankedFreeModels;
++    try {
++        const key = process.env.OPENROUTER_API_KEY || "";
++        const headers = key ? { "Authorization": `Bearer ${key}` } : {};
++        const res = await fetch("https://shir-man.com/api/free-llm/top-models", { headers, signal: AbortSignal.timeout(8000) });
++        if (!res.ok) return [];
++        const data = await res.json();
++        const models = (data.models || [])
++            .filter(m => (m.contextLength || 0) >= 64000)
++            .sort((a, b) => (a.rank || 99) - (b.rank || 99));
++        _rankedFreeModels = models.map(m => m.id);
++        _rankedFreeModelsAt = Date.now();
++        return _rankedFreeModels;
++    } catch {
++        return [];
++    }
++}
++
++function isRateLimitOutput(stdout, stderr) {
++    const combined = (stdout || "") + (stderr || "");
++    return /rate.limit|429|too many requests|free-models-per/i.test(combined);
++}
++
++// ---------------------------------------------------------------------------
++// Per-company Claude-fallback hourly cap
++//
++// When OpenRouter exhausts, ALL hermes agents at a company would otherwise
++// stampede onto Claude in parallel — a real pricing cascade. Track invocations
++// per companyId in an in-memory sliding hour window; refuse fallback once the
++// cap is hit and surface the original carousel failure instead.
++//
++// In-memory is OK: all adapter instances live in the same node process (the
++// Paperclip server). Trade-offs:
++//   - `tsx watch` reload (dev) and full server restart both reset the counter.
++//     Acceptable: hourly granularity means a reset gives you "up to 5 more"
++//     for the next hour, not unlimited burst — and the FALLBACK_USED stdout
++//     marker still appears in run logs so operators can audit post-hoc.
++//   - Map is keyed by companyId and bounded by the company count (typically
++//     <10 in production), so no unbounded growth.
++//   - Cap=0 disables fallback entirely (treated as cap_exceeded immediately).
++// ---------------------------------------------------------------------------
++const CLAUDE_FALLBACK_WINDOW_MS = 60 * 60 * 1000;
++const _claudeFallbackByCompany = new Map(); // companyId -> { count, windowStart }
++
++function _resolveFallbackCap() {
++    const raw = parseInt(process.env.HERMES_FALLBACK_CLAUDE_MAX_PER_HOUR ?? "", 10);
++    if (Number.isFinite(raw) && raw >= 0) return raw;
++    return 5;
++}
++
++function tryConsumeClaudeFallbackBudget(companyId) {
++    const cap = _resolveFallbackCap();
++    if (cap <= 0) return { allowed: false, count: 0, cap, reason: "cap_zero" };
++    const key = companyId || "_unknown";
++    const now = Date.now();
++    let entry = _claudeFallbackByCompany.get(key);
++    if (!entry || now - entry.windowStart >= CLAUDE_FALLBACK_WINDOW_MS) {
++        entry = { count: 0, windowStart: now };
++    }
++    if (entry.count >= cap) {
++        _claudeFallbackByCompany.set(key, entry);
++        return { allowed: false, count: entry.count, cap, reason: "cap_exceeded" };
++    }
++    entry.count += 1;
++    _claudeFallbackByCompany.set(key, entry);
++    return { allowed: true, count: entry.count, cap };
++}
++
++function estimatePromptTokens(prompt) {
++    // Crude — chars/4 is the well-known rough estimate. Operators only need
++    // an order-of-magnitude figure to spot runaway costs in logs.
++    if (!prompt) return 0;
++    return Math.ceil(prompt.length / 4);
++}
++
+ // ---------------------------------------------------------------------------
+ // Main execute
+ // ---------------------------------------------------------------------------
+@@ -279,6 +377,7 @@ export async function execute(ctx) {
+         args.push("-v");
+     // Tag sessions as "tool" source so they don't clutter the user's session history.
+     // Requires hermes-agent >= PR #3255 (feat/session-source-tag).
++    args.push("--yolo");
+     args.push("--source", "tool");
+     // Session resume
+     const prevSessionId = cfgString(ctx.runtime?.sessionParams?.sessionId);
+@@ -295,6 +394,11 @@ export async function execute(ctx) {
+     };
+     if (ctx.runId)
+         env.PAPERCLIP_RUN_ID = ctx.runId;
++    if (ctx.authToken) {
++        env.PAPERCLIP_API_KEY = ctx.authToken;
++    } else {
++        console.log("[hermes-adapter] WARNING: no authToken, PAPERCLIP_API_KEY not set");
++    }
+     const taskId = cfgString(ctx.config?.taskId);
+     if (taskId)
+         env.PAPERCLIP_TASK_ID = taskId;
+@@ -338,13 +442,141 @@ export async function execute(ctx) {
+         }
+         return ctx.onLog(stream, chunk);
+     };
+-    const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+-        cwd,
+-        env,
+-        timeoutSec,
+-        graceSec,
+-        onLog: wrappedOnLog,
+-    });
++    // ── Startup jitter — spread concurrent demand wakes across 30s ──────────
++    const jitterMs = Math.floor(Math.random() * 30000);
++    if (jitterMs > 0) await new Promise(r => setTimeout(r, jitterMs));
++    // ── Key carousel + model fallback ─────────────────────────────────────
++    // Collect all available API keys (rotate on rate-limit, no delay needed)
++    const allKeys = [
++        process.env.OPENROUTER_API_KEY,
++        process.env.OPENROUTER_API_KEY_2,
++        process.env.OPENROUTER_API_KEY_3,
++        process.env.OPENROUTER_API_KEY_4,
++        process.env.OPENROUTER_API_KEY_5,
++        process.env.OPENROUTER_API_KEY_6,
++    ].filter(Boolean);
++    // Randomize starting key so concurrent agents spread across the pool
++    const keyStart = Math.floor(Math.random() * allKeys.length);
++    const orderedKeys = [...allKeys.slice(keyStart), ...allKeys.slice(0, keyStart)];
++    // Pre-set a key so Hermes has OPENROUTER_API_KEY for compression init
++    env.OPENROUTER_API_KEY = orderedKeys[0];
++    const rankedModels = await getRankedFreeModels();
++    // Skip models hermes rejects (32K context) or that consistently hit per-day limits
++    const CAROUSEL_SKIP = new Set(["openrouter/free", "nvidia/nemotron-3-super-120b-a12b:free", "nvidia/nemotron-nano-9b-v2:free"]);
++    const modelCandidates = [
++        ...(CAROUSEL_SKIP.has(model) ? [] : [model]),
++        ...rankedModels.filter(m => m !== model && !CAROUSEL_SKIP.has(m))
++    ];
++    const buildArgs = (candidateModel) => {
++        const a = [...args];
++        const mIdx = a.indexOf("-m");
++        if (mIdx !== -1 && mIdx + 1 < a.length) { a[mIdx + 1] = candidateModel; }
++        else if (candidateModel) { a.push("-m", candidateModel); }
++        return a;
++    };
++    let result;
++    let succeeded = false;
++    // Non-OpenRouter providers (copilot, anthropic, gemini, etc.) have their own auth
++    // and don't use the OpenRouter key carousel — run hermes directly.
++    const isNonOpenRouterProvider = provider && provider !== "openrouter" && provider !== "auto" && VALID_PROVIDERS.includes(provider);
++    if (isNonOpenRouterProvider) {
++        await ctx.onLog("stdout", `[hermes] Using ${provider} provider directly (bypassing OpenRouter carousel)\n`);
++        result = await runChildProcess(ctx.runId, hermesCmd, args, {
++            cwd, env, timeoutSec, graceSec, onLog: wrappedOnLog,
++            onSpawn: ctx.onSpawn, // Report child PID to Paperclip so reaper sees a live process after server restart.
++        });
++        succeeded = (result.exitCode === 0) && !isRateLimitOutput(result.stdout, result.stderr);
++    } else {
++    // Walk every (model, key) combo. Only stop early on a clean exit (code 0 AND no
++    // rate-limit text). Any other failure — rate-limit, model-not-found, transient
++    // 5xx, model rejecting our prompt — rotates to the next key, then next model.
++    await ctx.onLog("stdout", `[hermes] Carousel: ${modelCandidates.length} models × ${orderedKeys.length} keys available\n`);
++    outer: for (let mi = 0; mi < modelCandidates.length; mi++) {
++        const candidateModel = modelCandidates[mi];
++        for (let ki = 0; ki < orderedKeys.length; ki++) {
++            env.OPENROUTER_API_KEY = orderedKeys[ki];
++            result = await runChildProcess(ctx.runId, hermesCmd, buildArgs(candidateModel), {
++                cwd, env, timeoutSec, graceSec, onLog: wrappedOnLog,
++                // Per-iteration onSpawn is intentional (correctness > DB cost). Iteration N's
++                // child exits before N+1 starts, so the reaper must see N+1's live PID — not
++                // a stale one from N. Coalescing would let a server restart mid-carousel
++                // orphan the running child. Worst case is up to ~36 PID upserts per
++                // exhausting run, which is bounded and rare.
++                onSpawn: ctx.onSpawn,
++            });
++            const cleanExit = (result.exitCode === 0);
++            const rateLimited = isRateLimitOutput(result.stdout, result.stderr);
++            if (cleanExit && !rateLimited) { succeeded = true; break outer; }
++            const reason = rateLimited ? "rate-limited" : `exit=${result.exitCode}`;
++            await ctx.onLog("stdout", `[hermes] Failed (${reason}): model ${mi + 1}/${modelCandidates.length} (${candidateModel}), key ${ki + 1}/${orderedKeys.length} — trying next key...\n`);
++        }
++        await ctx.onLog("stdout", `[hermes] All keys exhausted on ${candidateModel}, trying next model (${mi + 2}/${modelCandidates.length})...\n`);
++    }
++    if (!succeeded) {
++        // Every (model, key) combo failed. Hand the same prompt to Claude Sonnet via the
++        // `claude` CLI immediately (skipping the prior 65s rate-window-reset wait + final retry,
++        // which together pushed runs past Paperclip's ~5min orphan-reaper threshold). Burns the
++        // operator's Claude subscription quota but rescues IC/reviewer work when OpenRouter
++        // daily caps hit.
++        //
++        // Two gates protect against runaway cost:
++        //   1. HERMES_DISABLE_CLAUDE_FALLBACK=1 — global kill switch.
++        //   2. HERMES_FALLBACK_CLAUDE_MAX_PER_HOUR (default 5) — per-company hourly cap.
++        //      All hermes agents at a company stampede onto Claude in parallel when
++        //      OpenRouter caps hit; without a cap that's a real pricing cascade.
++        const companyId = ctx.agent?.companyId || "";
++        const agentId = ctx.agent?.id || "";
++        if (process.env.HERMES_DISABLE_CLAUDE_FALLBACK === "1") {
++            await ctx.onLog("stdout", `[hermes] Carousel exhausted (${modelCandidates.length} models × ${orderedKeys.length} keys); Claude fallback disabled. Surfacing failure to Paperclip.\n`);
++        } else {
++            const budget = tryConsumeClaudeFallbackBudget(companyId);
++            if (!budget.allowed) {
++                await ctx.onLog("stdout", `[hermes] FALLBACK_SKIPPED company=${companyId} agent=${agentId} reason=${budget.reason} count=${budget.count}/${budget.cap} window=1h. Surfacing original carousel failure.\n`);
++            } else {
++                const claudeCmd = process.env.HERMES_FALLBACK_CLAUDE_CMD || "claude";
++                const claudeModel = process.env.HERMES_FALLBACK_CLAUDE_MODEL || "sonnet";
++                const promptTokens = estimatePromptTokens(prompt);
++                await ctx.onLog("stdout", `[hermes] FALLBACK_USED company=${companyId} agent=${agentId} model=${claudeModel} prompt_tokens_est=${promptTokens} budget=${budget.count}/${budget.cap}\n`);
++                await ctx.onLog("stdout", `[hermes] Carousel exhausted (${modelCandidates.length} models × ${orderedKeys.length} keys). Falling back to ${claudeCmd} --model ${claudeModel} (Claude subscription quota)...\n`);
++                // Frame the hermes prompt for claude. The hermes prompt is self-contained
++                // (agent identity, task body, curl recipes for marking issues done) and
++                // uses bash/curl conventions that Claude Code can execute directly via
++                // Bash. We pipe via stdin (not argv) to avoid argv-length limits and
++                // shell-quoting hazards on multi-KB prompts. We also --add-dir cwd so
++                // claude can read the worktree the agent would have had.
++                const fallbackFraming = [
++                    `# Fallback execution context`,
++                    ``,
++                    `You are running as a ONE-SHOT Claude Sonnet fallback for the Hermes-based`,
++                    `agent below because OpenRouter's free-tier carousel exhausted (every`,
++                    `(model × key) combination either rate-limited or failed).`,
++                    ``,
++                    `Treat the prompt below as the agent's normal wake instructions. Use Bash`,
++                    `for the curl commands; PAPERCLIP_API_KEY is in your environment. Working`,
++                    `directory: ${cwd}. Do the work, mark the issue done as instructed, exit.`,
++                    ``,
++                    `--- AGENT PROMPT ---`,
++                    ``,
++                    prompt,
++                ].join("\n");
++                const claudeArgs = ["--print", "--model", claudeModel, "--dangerously-skip-permissions", "--add-dir", cwd];
++                const claudeResult = await runChildProcess(ctx.runId, claudeCmd, claudeArgs, {
++                    cwd, env, timeoutSec, graceSec, onLog: wrappedOnLog,
++                    onSpawn: ctx.onSpawn, // Bug 4: see comment in carousel loop above — keep per-spawn PID reporting for reaper correctness.
++                    stdin: fallbackFraming,
++                });
++                if (claudeResult.exitCode === 0) {
++                    await ctx.onLog("stdout", `[hermes] Claude fallback succeeded (${claudeModel}).\n`);
++                    result = claudeResult;
++                    succeeded = true;
++                } else {
++                    await ctx.onLog("stdout", `[hermes] Claude fallback also failed (exit=${claudeResult.exitCode}). Surfacing failure to Paperclip.\n`);
++                    result = claudeResult;
++                }
++            }
++        }
++    }
++    }
+     // ── Parse output ───────────────────────────────────────────────────────
+     const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+     await ctx.onLog("stdout", `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`);
+diff --git a/dist/shared/constants.js b/dist/shared/constants.js
+index b1d9995e53585c347e247facf187cc5be0e197a1..54ab32b053bedee90753da74df85c8d54701a17a 100644
+--- a/dist/shared/constants.js
++++ b/dist/shared/constants.js
+@@ -26,6 +26,11 @@ export const VALID_PROVIDERS = [
+     "kimi-coding",
+     "minimax",
+     "minimax-cn",
++    "copilot",
++    "copilot-acp",
++    "anthropic",
++    "gemini",
++    "ollama-cloud",
+ ];
+ /** Regex to extract session ID from Hermes CLI output. */
+ export const SESSION_ID_REGEX = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
