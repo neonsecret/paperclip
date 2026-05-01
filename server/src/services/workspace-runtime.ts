@@ -1013,6 +1013,15 @@ export async function realizeExecutionWorkspace(input: {
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
     : path.join(repoRoot, ".paperclip", "worktrees");
   const worktreePath = path.join(worktreeParentDir, branchName);
+  // Guard against empty/collapsed branch names (e.g. branchTemplate "feature/{{issue.identifier}}"
+  // with empty identifier renders to "feature/", sanitizes to "feature", and worktreePath
+  // collapses to an intermediate dir like ".../zeus/feature" that already exists as the
+  // parent of all real worktrees but isn't itself a registered worktree.
+  if (worktreePath === worktreeParentDir || !worktreePath.startsWith(worktreeParentDir + path.sep)) {
+    throw new Error(
+      `Branch name "${branchName}" produced invalid worktree path "${worktreePath}" — check branchTemplate and that the issue identifier is populated.`,
+    );
+  }
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
     : input.base.repoRef ?? null;
@@ -1020,7 +1029,9 @@ export async function realizeExecutionWorkspace(input: {
     ?? await detectDefaultBranch(repoRoot)
     ?? "HEAD";
 
-  await fs.mkdir(worktreeParentDir, { recursive: true });
+  // mkdir the LEAF's parent (handles slash-containing branch names like "feature/MRZ-84"
+  // by creating the intermediate "feature/" dir before git worktree add needs it).
+  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
   async function reuseExistingWorktree(reusablePath: string) {
     if (input.recorder) {
