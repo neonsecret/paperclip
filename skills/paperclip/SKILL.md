@@ -75,7 +75,24 @@ Use comments incrementally:
 
 Read enough ancestor/comment context to understand _why_ the task exists and what changed. Do not reflexively reload the whole thread on every heartbeat.
 
-**Execution-policy review/approval wakes.** If the issue is `in_review` with `executionState`, inspect `currentStageType`, `currentParticipant`, `returnAssignee`, and `lastDecisionOutcome`.
+**Search for related issue context BEFORE giving up or asking the user.** Issues rarely live in isolation. If the task description, the latest comment, or your `heartbeat-context` ancestor summaries reference another ticket id (`NEO-48`, `MRZ-71`, etc.), an external system (Telegram bot, Buffer, Notion, a service name), a feature flag, or a domain term you don't recognize — search Paperclip first:
+
+- Direct lookup of a referenced ticket: `GET /api/companies/{companyId}/issues?slug=NEO-48` or `GET /api/issues/NEO-48` (then read its description, recent comments, work-products, and child issues if any)
+- Keyword search across titles + descriptions + comments: `GET /api/companies/{companyId}/issues?q=telegram+bot+reels` (the `q` param is full-text)
+- Sibling issues under the same parent: `GET /api/companies/{companyId}/issues?parentId={parentUuid}` (use `parentId` from heartbeat-context)
+- Same-project recent work: `GET /api/companies/{companyId}/issues?projectId={projectId}&status=done&limit=20`
+
+When the task is "do X with Y" and Y is referenced but not defined inline (e.g. "check which reels I sent to the telegram bot" — but no telegram-bot context in this issue), search before declaring you can't proceed. The state and history almost always exist on another issue or in past work-products. Only ask the user when search comes back empty AND ancestor/comment context doesn't fill the gap.
+
+**Trust live wake state over snapshots.** When you receive a wake, the `paperclipWake.issue.{status,priority,assigneeAgentId}` fields and the `paperclipWake.comments[]` array are the authoritative current state at wake time. The `paperclipContinuationSummary` document is older — it was written when your **previous** run finished, before any comment or status change that triggered THIS run. If they disagree (summary says `blocked` but `paperclipWake.issue.status` is `in_progress`), trust the wake. The summary is recap, not truth.
+
+**`issue_assigned` wakes can carry critical new comments.** When the platform fires `wakeReason: "issue_assigned"` because the issue was reassigned to you (e.g. a user took the ticket back from you and then handed it back with new feedback in one update), the same wake payload often includes a `wakeCommentId` and the comment in `paperclipWake.comments[]`. Treat that comment as the highest-priority new context, not as background — your previous attempt likely failed and the user/agent is telling you what to do differently. Do NOT just re-read the description and start the original task over from scratch.
+
+**Reviewers and approvers.** Issues can declare reviewers and approvers up front via the UI's "Reviewers" / "Approvers" rows on the new-issue dialog. These get serialised into `executionPolicy.stages[].participants` on the issue. As work progresses, Paperclip walks the stages and sets `executionState.currentParticipant` to whichever reviewer/approver is active at that moment, then wakes them. You will be woken with `wakeReason: "execution_review_requested"` (or `execution_approval_requested` / `execution_changes_requested`) if you are listed as a reviewer/approver and your stage activates.
+
+If you receive that wake, read the issue, the work products it links to, and the prior stage's decision (`executionState.lastDecisionOutcome`) before approving or requesting changes. The decision protocol below is the same for review and approval stages.
+
+**Execution-policy review/approval wakes.** If the issue is in `in_review` and includes `executionState`, inspect these fields immediately:
 
 If `currentParticipant` matches you, submit your decision via the normal update route — there is no separate execution-decision endpoint:
 

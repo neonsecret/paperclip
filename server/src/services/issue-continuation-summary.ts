@@ -142,12 +142,18 @@ export function buildContinuationSummaryMarkdown(input: {
   const mode = inferMode(issue, run);
   const nextAction = inferNextAction(issue, run, extractPreviousNextAction(input.previousSummaryBody));
 
+  // Status and priority are deliberately NOT snapshotted here — the summary is
+  // written when the run finishes, but a comment/status update may land before
+  // the next run starts. Use the live `paperclipWake.issue.status` field from
+  // the wake payload instead. Snapshotting here causes stale-status confusion
+  // (observed on NEO-72: summary said "blocked" while live status was already
+  // "in_progress" from a comment-triggered transition 162 ms after run end).
   const body = [
     "# Continuation Summary",
     "",
     `- Issue: ${issue.identifier ?? issue.id} — ${issue.title}`,
-    `- Status: ${issue.status}`,
-    `- Priority: ${issue.priority}`,
+    `- Status at run end: ${issue.status} (read paperclipWake.issue.status for current)`,
+    `- Priority at run end: ${issue.priority}`,
     `- Current mode: ${mode}`,
     `- Last updated by run: ${run.id}`,
     `- Agent: ${agent.name} (${agent.adapterType ?? "unknown"})`,
