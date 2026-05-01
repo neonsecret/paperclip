@@ -164,6 +164,10 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+// Separate from withAgentStartLock: maybeEnqueueAutoContinuation must NOT
+// share that lock because its body calls enqueueWakeup → startNextQueuedRunForAgent,
+// which itself grabs withAgentStartLock. Sharing would deadlock.
+const autoContinuationLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -280,6 +284,10 @@ function mergeAdapterRecoveryMetadata(input: {
       : {}),
   };
 }
+// Minimum quiet time after a run finishes before reconcileStrandedAssignedIssues
+// will re-queue continuation for an in_progress / in_review issue. Less than this
+// races auto-continuation and bounded retries, producing duplicate wakes.
+const STRANDED_RECONCILE_MIN_AGE_MS = 30 * 1000;
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set(["approval_approved"]);
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
@@ -4029,6 +4037,105 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  // Auto-continuation: after a successful run, if the agent still has open
+  // assigned work, immediately queue another wake. Stops when queue is empty.
+  // Distinct from Path A (run-continuations.ts) which only handles stall recovery
+  // (plan_only / empty_response). This handles "still has more to do".
+  const AUTO_CONTINUATION_MAX = 50;
+  // Belt-and-suspenders cap window. autoContinuationCount on the run context is
+  // chain-local — it RESETS to 0 every time a non-auto-cont wake (issue_assigned,
+  // issue_commented, mention, ...) interleaves and starts a run with a fresh
+  // context. Under normal operation chains rarely propagate past 1-3 before an
+  // interruption, so the per-context cap effectively never fires. This time
+  // window counts every auto_continuation run for the agent regardless of
+  // chain breaks, giving the cap real teeth.
+  const AUTO_CONTINUATION_WINDOW_MS = 60 * 60 * 1000;
+  async function maybeEnqueueAutoContinuation(
+    agent: typeof agents.$inferSelect,
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    if (run.livenessState === "plan_only" || run.livenessState === "empty_response") return;
+    if (["paused", "terminated", "pending_approval"].includes(agent.status ?? "")) return;
+
+    // Per-agent in-process serialization. With maxConcurrentRuns > 1 two
+    // successful runs can finish in the same event-loop tick and both pass
+    // the alreadyQueued check below. Mirrors withAgentStartLock; uses a
+    // separate map because the body calls enqueueWakeup → startNextQueuedRunForAgent,
+    // which itself grabs startLocksByAgent (sharing would deadlock).
+    const previous = autoContinuationLocksByAgent.get(agent.id) ?? Promise.resolve();
+    const work = previous.then(async () => {
+      const count = asNumber(parseObject(run.contextSnapshot).autoContinuationCount, 0);
+      if (count >= AUTO_CONTINUATION_MAX) return;
+
+      // Time-window safety cap (see AUTO_CONTINUATION_WINDOW_MS comment above).
+      const windowStart = new Date(Date.now() - AUTO_CONTINUATION_WINDOW_MS);
+      const recentAutoContCount = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.agentId, agent.id),
+          eq(heartbeatRuns.companyId, agent.companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' = 'auto_continuation'`,
+          gt(heartbeatRuns.createdAt, windowStart),
+        ))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+      if (recentAutoContCount >= AUTO_CONTINUATION_MAX) {
+        logger.warn(
+          { agentId: agent.id, recentAutoContCount, windowMs: AUTO_CONTINUATION_WINDOW_MS },
+          "auto-continuation cap reached for agent (time window); skipping enqueue",
+        );
+        return;
+      }
+
+      const budgetBlock = await budgets.getInvocationBlock(agent.companyId, agent.id, {}).catch(() => null);
+      if (budgetBlock) return;
+      // Status set must match reconcileStrandedAssignedIssues' candidate filter
+      // (see reconciler ~line 4722). If we narrow this and the reconciler keeps
+      // in_review, an issue moved to in_review by the agent slips between: auto-
+      // continuation skips (no queued wake), then race guard B in the reconciler
+      // sees no queued wake and fires a duplicate continuation_needed wake on
+      // top. Keep them aligned. The agent itself decides whether an in_review
+      // issue needs further action (e.g. it's the currentParticipant) or to
+      // exit cleanly; the 50/hour cap bounds the worst case.
+      const hasWork = await db
+        .select({ id: issues.id }).from(issues)
+        .where(and(
+          eq(issues.companyId, agent.companyId),
+          eq(issues.assigneeAgentId, agent.id),
+          inArray(issues.status, ["todo", "in_progress", "in_review"]),
+        )).limit(1).then((rows) => rows.length > 0);
+      if (!hasWork) return;
+      const alreadyQueued = await db
+        .select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.agentId, agent.id),
+          eq(agentWakeupRequests.companyId, agent.companyId),
+          inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+        )).limit(1).then((rows) => rows.length > 0);
+      if (alreadyQueued) return;
+      await enqueueWakeup(agent.id, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "auto_continuation",
+        requestedByActorType: "system",
+        requestedByActorId: "heartbeat",
+        contextSnapshot: { autoContinuationCount: count + 1 },
+      });
+    });
+    const marker = work.then(
+      () => undefined,
+      () => undefined,
+    );
+    autoContinuationLocksByAgent.set(agent.id, marker);
+    try {
+      await work;
+    } finally {
+      if (autoContinuationLocksByAgent.get(agent.id) === marker) {
+        autoContinuationLocksByAgent.delete(agent.id);
+      }
+    }
+  }
+
   async function enqueueMissingIssueCommentRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -6216,6 +6323,119 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  async function hasActiveExecutionPath(companyId: string, issueId: string) {
+    const [run, deferredWake] = await Promise.all([
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            inArray(heartbeatRuns.status, [...ACTIVE_HEARTBEAT_RUN_STATUSES]),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    return Boolean(run || deferredWake);
+  }
+
+  async function enqueueStrandedIssueRecovery(input: {
+    issueId: string;
+    agentId: string;
+    reason: "issue_assignment_recovery" | "issue_continuation_needed";
+    retryReason: "assignment_recovery" | "issue_continuation_needed";
+    source: string;
+    retryOfRunId?: string | null;
+  }) {
+    const queued = await enqueueWakeup(input.agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: input.reason,
+      payload: {
+        issueId: input.issueId,
+        ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+      },
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: {
+        issueId: input.issueId,
+        taskId: input.issueId,
+        wakeReason: input.reason,
+        retryReason: input.retryReason,
+        source: input.source,
+        ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+      },
+    });
+
+    if (queued && input.retryOfRunId) {
+      return db
+        .update(heartbeatRuns)
+        .set({
+          retryOfRunId: input.retryOfRunId,
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, queued.id))
+        .returning()
+        .then((rows) => rows[0] ?? queued);
+    }
+
+    return queued;
+  }
+
+  async function escalateStrandedAssignedIssue(input: {
+    issue: typeof issues.$inferSelect;
+    previousStatus: "todo" | "in_progress";
+    latestRun: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "id" | "status" | "error" | "errorCode" | "contextSnapshot"
+    > | null;
+    comment: string;
+  }) {
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "blocked",
+    });
+    if (!updated) return null;
+
+    await issuesSvc.addComment(input.issue.id, input.comment, {});
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: "blocked",
+        previousStatus: input.previousStatus,
+        source: "heartbeat.reconcile_stranded_assigned_issue",
+        latestRunId: input.latestRun?.id ?? null,
+        latestRunStatus: input.latestRun?.status ?? null,
+        latestRunErrorCode: input.latestRun?.errorCode ?? null,
+      },
+    });
+
+    return updated;
+  }
+
   async function reconcileStrandedAssignedIssues() {
     return recovery.reconcileStrandedAssignedIssues();
   }
@@ -7545,6 +7765,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } else {
           await releaseIssueExecutionAndPromote(livenessRun);
+          if (outcome === "succeeded") {
+            await maybeEnqueueAutoContinuation(agent, livenessRun).catch((err) =>
+              logger.warn({ err, agentId: agent.id }, "auto-continuation enqueue failed"),
+            );
+          }
         }
       }
 
