@@ -1231,6 +1231,14 @@ export function buildHostServices(
         assertReadableOriginFilter(params.originKind);
         return applyWindow((await issues.list(companyId, params as any)) as Issue[], params);
       },
+      // Stub: the SDK contract was added by upstream PR #4244 but the host-side
+      // service + HTTP route were not shipped on this branch. Fail loudly so a
+      // plugin attempting to use it gets a clear signal rather than silent drift.
+      async createInteraction(_params) {
+        throw new Error(
+          "issues.createInteraction is not implemented on this server build — interaction service is pending upstream wire-up.",
+        );
+      },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
