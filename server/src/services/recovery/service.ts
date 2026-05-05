@@ -51,6 +51,10 @@ export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
+// Minimum quiet time after a run finishes before the reconciler re-queues
+// continuation. Less than this races auto-continuation and bounded retries,
+// producing duplicate wakes. Must mirror STRANDED_RECONCILE_MIN_AGE_MS in heartbeat.ts.
+const STRANDED_RECONCILE_MIN_AGE_MS = 30 * 1000;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 
@@ -1635,6 +1639,81 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (await hasActiveExecutionPath(issue.companyId, issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Race guard A: wait at least N seconds after the AGENT's most recent run
+      // finishes before declaring this issue stranded. Auto-continuation queues
+      // a fresh wake within milliseconds of any successful run, and bounded/
+      // rate-limit retries enqueue within seconds of a failure. Both are
+      // agent-level (not issue-level) — agent X finishing run on issue A queues
+      // a wake that may pick up issue B, but the per-issue latestRun for B
+      // doesn't reflect that. Audit on April 30 found 16/20 leaked wakes
+      // because the prior issue-scoped check missed agent-level recency.
+      const agentMostRecentFinish = await db
+        .select({ finishedAt: heartbeatRuns.finishedAt })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.companyId, issue.companyId),
+            sql`${heartbeatRuns.finishedAt} IS NOT NULL`,
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt))
+        .limit(1)
+        .then((rows) => rows[0]?.finishedAt ?? null);
+      if (agentMostRecentFinish) {
+        const ageMs = Date.now() - new Date(agentMostRecentFinish).getTime();
+        if (ageMs < STRANDED_RECONCILE_MIN_AGE_MS) {
+          result.skipped += 1;
+          continue;
+        }
+      }
+
+      // Race guard B: skip if any wake is already queued/deferred for this
+      // assigned agent — it will dispatch a run shortly. Auto-continuation
+      // wakes are agent-level (no issueId) so hasActiveExecutionPath above
+      // cannot see them; without this check the reconciler stamps a duplicate
+      // continuation_needed wake on top of a pending auto-continuation.
+      const hasQueuedWakeForAgent = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.companyId, issue.companyId),
+            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (hasQueuedWakeForAgent) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Race guard C: skip if the agent has any in-flight non-issue-scoped run
+      // (auto-continuation, timer, idle ping). Those runs may pick up this very
+      // issue once they execute since the agent reads its assigned work, but
+      // their context_snapshot has no issueId so hasActiveExecutionPath above
+      // misses them entirely. Empirically a running auto-cont was the actual
+      // reason a stranded-recovery wake fired 71s INTO the auto-cont run.
+      const hasInFlightAgentLevelRun = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.companyId, issue.companyId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+            sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') IS NULL`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (hasInFlightAgentLevelRun) {
         result.skipped += 1;
         continue;
       }
